@@ -36,7 +36,7 @@ entirely and is delivered immediately regardless of any in-flight messages.
 This is useful when downstream processing must be ordered per key but the
 pipeline runs with multiple threads.`).
 	Field(service.NewBloblangField("key").
-		Description("A Bloblang mapping evaluated per message to determine the serialization key. Messages with the same key are delivered sequentially. A null result bypasses serialization.")).
+		Description("A Bloblang mapping evaluated per message to determine the serialization key. Must assign to root using mapping syntax, e.g. `root = this.session_id`. Messages with the same key are delivered sequentially. A null result (`root = null`) bypasses serialization for that message.")).
 	Field(service.NewInputField("input").
 		Description("The nested input to read messages from."))
 
@@ -50,6 +50,7 @@ type pendingBatch struct {
 type keySerializerInput struct {
 	nested  *service.OwnedInput
 	keyExpr *bloblang.Executor
+	log     *service.Logger
 
 	// ready receives batches that are eligible for delivery to the pipeline.
 	// Batches are placed here when their key has no outstanding message.
@@ -69,7 +70,7 @@ type keySerializerInput struct {
 	closeErr error
 }
 
-func newKeySerializerInput(conf *service.ParsedConfig, _ *service.Resources) (service.BatchInput, error) {
+func newKeySerializerInput(conf *service.ParsedConfig, res *service.Resources) (service.BatchInput, error) {
 	keyExpr, err := conf.FieldBloblang("key")
 	if err != nil {
 		return nil, err
@@ -84,6 +85,7 @@ func newKeySerializerInput(conf *service.ParsedConfig, _ *service.Resources) (se
 	return &keySerializerInput{
 		nested:       nested,
 		keyExpr:      keyExpr,
+		log:          res.Logger(),
 		ready:        make(chan *pendingBatch, 4096),
 		inFlight:     make(map[string]struct{}),
 		pending:      make(map[string][]*pendingBatch),
@@ -125,7 +127,7 @@ func (k *keySerializerInput) readerLoop() {
 
 		keyVal, err := batch[0].BloblangQueryValue(k.keyExpr)
 		if err != nil {
-			// Key evaluation failed; nack so the upstream can retry.
+			k.log.Errorf("Key expression evaluation failed, message will be nacked: %v", err)
 			_ = ackFn(k.readerCtx, err)
 			continue
 		}
@@ -134,7 +136,13 @@ func (k *keySerializerInput) readerLoop() {
 		if keyVal == nil {
 			pb = &pendingBatch{batch: batch, ackFn: ackFn, bypass: true}
 		} else {
-			key := fmt.Sprint(keyVal)
+			key, ok := keyVal.(string)
+			if !ok {
+				typeErr := fmt.Errorf("key expression must return a string or null, got %T", keyVal)
+				k.log.Errorf("Key expression returned invalid type, message will be nacked: %v", typeErr)
+				_ = ackFn(k.readerCtx, typeErr)
+				continue
+			}
 			pb = &pendingBatch{batch: batch, ackFn: ackFn, key: key}
 
 			k.mu.Lock()

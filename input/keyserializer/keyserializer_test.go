@@ -1,8 +1,11 @@
 package keyserializer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,10 +59,9 @@ func (m *mockInput) ReadBatch(ctx context.Context) (service.MessageBatch, servic
 
 func (m *mockInput) Close(_ context.Context) error { return nil }
 
-// newTestInput builds a keySerializerInput wired to the given mock, using the
-// provided Bloblang interpolation expression as the key. Connect is called and
-// Close is registered as a test cleanup.
-func newTestInput(t *testing.T, keyExpr string, mock *mockInput) *keySerializerInput {
+// newTestInputRes builds a keySerializerInput wired to the given mock and
+// resources. Connect is called and Close is registered as a test cleanup.
+func newTestInputRes(t *testing.T, keyExpr string, mock *mockInput, res *service.Resources) *keySerializerInput {
 	t.Helper()
 
 	env := service.NewEnvironment()
@@ -72,7 +74,7 @@ func newTestInput(t *testing.T, keyExpr string, mock *mockInput) *keySerializerI
 	pConf, err := spec.ParseYAML(yaml, env)
 	require.NoError(t, err)
 
-	inp, err := newKeySerializerInput(pConf, nil)
+	inp, err := newKeySerializerInput(pConf, res)
 	require.NoError(t, err)
 
 	ks := inp.(*keySerializerInput)
@@ -80,6 +82,14 @@ func newTestInput(t *testing.T, keyExpr string, mock *mockInput) *keySerializerI
 	t.Cleanup(func() { _ = ks.Close(context.Background()) })
 
 	return ks
+}
+
+// newTestInput builds a keySerializerInput wired to the given mock, using the
+// provided Bloblang mapping expression as the key. Connect is called and
+// Close is registered as a test cleanup.
+func newTestInput(t *testing.T, keyExpr string, mock *mockInput) *keySerializerInput {
+	t.Helper()
+	return newTestInputRes(t, keyExpr, mock, service.MockResources())
 }
 
 // msg builds a single-message batch with a metadata key field set to key.
@@ -124,7 +134,7 @@ func batchBody(t *testing.T, batch service.MessageBatch) string {
 // keys are both available without needing to ACK either.
 func TestDifferentKeysDeliveredConcurrently(t *testing.T) {
 	mock := newMockInput()
-	ks := newTestInput(t, `meta("key")`, mock)
+	ks := newTestInput(t, `root = meta("key")`, mock)
 
 	mock.push(msg("a1", "A"))
 	mock.push(msg("b1", "B"))
@@ -143,7 +153,7 @@ func TestDifferentKeysDeliveredConcurrently(t *testing.T) {
 // held back until the first is ACKed.
 func TestSameKeySerializes(t *testing.T) {
 	mock := newMockInput()
-	ks := newTestInput(t, `meta("key")`, mock)
+	ks := newTestInput(t, `root = meta("key")`, mock)
 
 	ackRecv1 := mock.push(msg("first", "K"))
 	mock.push(msg("second", "K"))
@@ -169,7 +179,7 @@ func TestSameKeySerializes(t *testing.T) {
 // delivered in the order they were produced.
 func TestSameKeyOrderPreserved(t *testing.T) {
 	mock := newMockInput()
-	ks := newTestInput(t, `meta("key")`, mock)
+	ks := newTestInput(t, `root = meta("key")`, mock)
 
 	mock.push(msg("one", "K"))
 	mock.push(msg("two", "K"))
@@ -197,7 +207,7 @@ func TestSameKeyOrderPreserved(t *testing.T) {
 // releases the next pending message for the same key.
 func TestNackReleasesNextPending(t *testing.T) {
 	mock := newMockInput()
-	ks := newTestInput(t, `meta("key")`, mock)
+	ks := newTestInput(t, `root = meta("key")`, mock)
 
 	mock.push(msg("first", "K"))
 	mock.push(msg("second", "K"))
@@ -218,7 +228,7 @@ func TestNackReleasesNextPending(t *testing.T) {
 // run independently, and pending messages for each key are released in order.
 func TestMixedKeysInterleavedRelease(t *testing.T) {
 	mock := newMockInput()
-	ks := newTestInput(t, `meta("key")`, mock)
+	ks := newTestInput(t, `root = meta("key")`, mock)
 
 	// Enqueue: A1, A2, B1 — A2 must wait for A1; B1 is independent.
 	mock.push(msg("a1", "A"))
@@ -257,7 +267,7 @@ func TestMixedKeysInterleavedRelease(t *testing.T) {
 // ErrEndOfInput, ReadBatch eventually returns ErrEndOfInput too.
 func TestErrEndOfInputPropagates(t *testing.T) {
 	mock := newMockInput()
-	ks := newTestInput(t, `meta("key")`, mock)
+	ks := newTestInput(t, `root = meta("key")`, mock)
 
 	mock.push(msg("only", "K"))
 	mock.end()
@@ -283,7 +293,7 @@ func msgNoKey(body string) service.MessageBatch {
 // message with a keyed in-flight batch would otherwise be blocked.
 func TestNullKeyBypassesSerialization(t *testing.T) {
 	mock := newMockInput()
-	ks := newTestInput(t, `meta("key")`, mock)
+	ks := newTestInput(t, `root = meta("key")`, mock)
 
 	// Keyed message first, then a null-key message behind it.
 	mock.push(msg("keyed", "K"))
@@ -305,7 +315,7 @@ func TestNullKeyBypassesSerialization(t *testing.T) {
 // message does not interfere with the serialization of keyed messages.
 func TestNullKeyDoesNotBlockKeyedMessages(t *testing.T) {
 	mock := newMockInput()
-	ks := newTestInput(t, `meta("key")`, mock)
+	ks := newTestInput(t, `root = meta("key")`, mock)
 
 	mock.push(msg("k1", "K"))
 	mock.push(msgNoKey("bypass"))
@@ -336,11 +346,103 @@ func TestNullKeyDoesNotBlockKeyedMessages(t *testing.T) {
 	require.NoError(t, ack3(t.Context(), nil))
 }
 
+// msgWithIntKey builds a batch that causes the key expression
+// `root = if meta("intkey") != null { 42 } else { meta("key") }` to
+// return an integer (invalid) for the given body.
+func msgWithIntKey(body string) service.MessageBatch {
+	m := service.NewMessage([]byte(body))
+	m.MetaSet("intkey", "1")
+	return service.MessageBatch{m}
+}
+
+// TestNonStringKeyNacks verifies that when the key expression returns a
+// non-string, non-null value, the message is nacked and never delivered to
+// ReadBatch.
+func TestNonStringKeyNacks(t *testing.T) {
+	mock := newMockInput()
+	// Expression returns int64(42) when meta "intkey" is set, string otherwise.
+	ks := newTestInput(t, `root = if meta("intkey") != null { 42 } else { meta("key") }`, mock)
+
+	badAckCh := mock.push(msgWithIntKey("bad"))
+	goodAckCh := mock.push(msg("good", "K"))
+
+	// "bad" is nacked (non-string key); "good" has a valid string key and
+	// should be delivered immediately since "bad" was never in-flight.
+	b, ack := mustReadBatch(t, ks)
+	assert.Equal(t, "good", batchBody(t, b))
+	require.NoError(t, ack(t.Context(), nil))
+	assert.NoError(t, <-goodAckCh)
+
+	// The nack for "bad" should have been delivered before ReadBatch returned.
+	select {
+	case err := <-badAckCh:
+		require.Error(t, err)
+	default:
+		t.Fatal("expected nack for bad message but none received")
+	}
+}
+
+// newCapturingLogger returns a service.Logger that writes to buf and a
+// *service.Resources wired to it, for asserting on logged output.
+func newCapturingLogger(buf *bytes.Buffer) *service.Resources {
+	handler := slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	logger := service.NewLoggerFromSlog(slog.New(handler))
+	return service.MockResources(service.MockResourcesOptUseLogger(logger))
+}
+
+// TestNonStringKeyLogsError verifies that when the key expression returns a
+// non-string, non-null value the error is logged at error level.
+func TestNonStringKeyLogsError(t *testing.T) {
+	var buf bytes.Buffer
+	res := newCapturingLogger(&buf)
+
+	mock := newMockInput()
+	newTestInputRes(t, `root = if meta("intkey") != null { 42 } else { meta("key") }`, mock, res)
+
+	ackCh := mock.push(msgWithIntKey("bad"))
+
+	// Wait for the nack to confirm the readerLoop processed the message.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	select {
+	case <-ackCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for nack")
+	}
+
+	assert.True(t, strings.Contains(buf.String(), "invalid type"),
+		"expected error log about invalid type, got: %s", buf.String())
+}
+
+// TestEvalErrorLogsError verifies that when the key expression returns an
+// evaluation error the error is logged at error level.
+func TestEvalErrorLogsError(t *testing.T) {
+	var buf bytes.Buffer
+	res := newCapturingLogger(&buf)
+
+	mock := newMockInput()
+	// throw() forces a runtime evaluation error from the mapping.
+	newTestInputRes(t, `root = throw("forced error")`, mock, res)
+
+	ackCh := mock.push(msg("bad", "K"))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	select {
+	case <-ackCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for nack")
+	}
+
+	assert.True(t, strings.Contains(buf.String(), "forced error"),
+		"expected error log containing eval error, got: %s", buf.String())
+}
+
 // TestCloseDoesNotHang verifies that Close returns promptly even when
 // ReadBatch is blocked waiting for a message.
 func TestCloseDoesNotHang(t *testing.T) {
 	mock := newMockInput()
-	ks := newTestInput(t, `meta("key")`, mock)
+	ks := newTestInput(t, `root = meta("key")`, mock)
 
 	// ReadBatch in background — will block because no messages are enqueued.
 	done := make(chan struct{})

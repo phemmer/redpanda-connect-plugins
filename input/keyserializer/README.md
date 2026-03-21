@@ -22,7 +22,7 @@ input:
 
 | Field | Description |
 |---|---|
-| `key` | A Bloblang mapping evaluated against each message to produce the serialization key. A `null` result bypasses serialization for that message. |
+| `key` | A Bloblang **mapping** evaluated against each message to produce the serialization key. Must use `root = ` assignment syntax (e.g. `root = meta("nats_subject")`). A `root = null` result bypasses serialization for that message. |
 | `input` | The nested input to read from. Any Redpanda Connect input is supported. |
 
 ## Examples
@@ -32,7 +32,7 @@ input:
 ```yaml
 input:
   key_serializer:
-    key: meta("nats_subject")
+    key: root = meta("nats_subject")
     input:
       nats_jetstream:
         urls: [nats://localhost:4222]
@@ -50,7 +50,7 @@ Messages that should not be serialized (e.g. control messages or one-off events)
 input:
   key_serializer:
     key: |
-      if meta("type") == "ordered" { meta("entity_id") } else { null }
+      root = if meta("type") == "ordered" { meta("entity_id") } else { null }
     input:
       nats_jetstream:
         urls: [nats://localhost:4222]
