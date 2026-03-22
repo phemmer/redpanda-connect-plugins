@@ -105,6 +105,13 @@ func (k *keySerializerInput) Connect(ctx context.Context) error {
 	return nil
 }
 
+// nackMsg logs err at error level and nacks the message. All nack paths in
+// readerLoop must go through this method so that no nack is ever silent.
+func (k *keySerializerInput) nackMsg(ackFn service.AckFunc, err error) {
+	k.log.Errorf("Message nacked: %v", err)
+	_ = ackFn(k.readerCtx, err)
+}
+
 // readerLoop continuously reads from the nested input and dispatches batches to
 // per-key queues. Batches whose key is not in-flight are sent directly to the
 // ready channel; batches whose key is already in-flight are queued until the
@@ -125,38 +132,9 @@ func (k *keySerializerInput) readerLoop() {
 			continue
 		}
 
-		keyVal, err := batch[0].BloblangQueryValue(k.keyExpr)
-		if err != nil {
-			k.log.Errorf("Key expression evaluation failed, message will be nacked: %v", err)
-			_ = ackFn(k.readerCtx, err)
+		pb := k.evalKey(batch, ackFn)
+		if pb == nil {
 			continue
-		}
-
-		var pb *pendingBatch
-		if keyVal == nil {
-			pb = &pendingBatch{batch: batch, ackFn: ackFn, bypass: true}
-		} else {
-			key, ok := keyVal.(string)
-			if !ok {
-				typeErr := fmt.Errorf("key expression must return a string or null, got %T", keyVal)
-				k.log.Errorf("Key expression returned invalid type, message will be nacked: %v", typeErr)
-				_ = ackFn(k.readerCtx, typeErr)
-				continue
-			}
-			pb = &pendingBatch{batch: batch, ackFn: ackFn, key: key}
-
-			k.mu.Lock()
-			_, taken := k.inFlight[key]
-			if !taken {
-				k.inFlight[key] = struct{}{}
-			} else {
-				k.pending[key] = append(k.pending[key], pb)
-			}
-			k.mu.Unlock()
-
-			if taken {
-				continue
-			}
 		}
 
 		// Send to ready outside the lock. If the channel is full this blocks
@@ -170,6 +148,66 @@ func (k *keySerializerInput) readerLoop() {
 			return
 		}
 	}
+}
+
+// evalKey evaluates the key expression for the first message in batch and
+// returns a pendingBatch ready for dispatch, or nil if the batch was nacked or
+// queued behind an in-flight message for the same key.
+//
+// BloblangQuery uses MapPart internally, which sets both ctx.value (enabling
+// `this.field` access) and ctx.NewMeta from a shallow copy of the input part
+// (enabling `meta()` access).
+func (k *keySerializerInput) evalKey(batch service.MessageBatch, ackFn service.AckFunc) *pendingBatch {
+	resultMsg, err := batch.BloblangQuery(0, k.keyExpr)
+	if err != nil {
+		k.nackMsg(ackFn, fmt.Errorf("key expression evaluation failed: %w", err))
+		return nil
+	}
+
+	if resultMsg == nil {
+		// root = deleted() — treat same as null: bypass serialization.
+		return &pendingBatch{batch: batch, ackFn: ackFn, bypass: true}
+	}
+
+	// MapPart stores string/[]byte results via SetBytes and other types via
+	// SetStructuredMut. HasStructured distinguishes: if set, the result is a
+	// non-string Go value (null, number, object, etc.); if not set, the
+	// result was a string and is available via AsBytes.
+	if resultMsg.HasStructured() {
+		keyVal, err := resultMsg.AsStructuredMut()
+		if err != nil {
+			k.nackMsg(ackFn, fmt.Errorf("key expression result could not be read: %w", err))
+			return nil
+		}
+		if keyVal == nil {
+			return &pendingBatch{batch: batch, ackFn: ackFn, bypass: true}
+		}
+		k.nackMsg(ackFn, fmt.Errorf("key expression must return a string or null, got %T", keyVal))
+		return nil
+	}
+
+	keyBytes, err := resultMsg.AsBytes()
+	if err != nil {
+		k.nackMsg(ackFn, fmt.Errorf("key expression result could not be read: %w", err))
+		return nil
+	}
+	key := string(keyBytes)
+
+	pb := &pendingBatch{batch: batch, ackFn: ackFn, key: key}
+
+	k.mu.Lock()
+	_, taken := k.inFlight[key]
+	if !taken {
+		k.inFlight[key] = struct{}{}
+	} else {
+		k.pending[key] = append(k.pending[key], pb)
+	}
+	k.mu.Unlock()
+
+	if taken {
+		return nil
+	}
+	return pb
 }
 
 // ReadBatch implements service.BatchInput.

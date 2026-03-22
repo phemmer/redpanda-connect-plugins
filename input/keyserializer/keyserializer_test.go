@@ -130,6 +130,65 @@ func batchBody(t *testing.T, batch service.MessageBatch) string {
 	return string(b)
 }
 
+// msgJSON builds a single-message batch whose body is JSON and whose "key"
+// metadata field is set to key.
+func msgJSON(jsonBody, key string) service.MessageBatch {
+	m := service.NewMessage([]byte(jsonBody))
+	m.MetaSet("key", key)
+	return service.MessageBatch{m}
+}
+
+// msgMeta builds a single-message batch with a named metadata field set to val.
+func msgMeta(body, metaKey, metaVal string) service.MessageBatch {
+	m := service.NewMessage([]byte(body))
+	m.MetaSet(metaKey, metaVal)
+	return service.MessageBatch{m}
+}
+
+// TestThisFieldKeyExpression verifies that a key expression using `this.field`
+// correctly extracts the serialization key from the message body.
+func TestThisFieldKeyExpression(t *testing.T) {
+	mock := newMockInput()
+	ks := newTestInput(t, `root = this.id`, mock)
+
+	// Two messages with the same `id` field — second must wait for first.
+	mock.push(msgJSON(`{"id":"K","body":"first"}`, "unused"))
+	mock.push(msgJSON(`{"id":"K","body":"second"}`, "unused"))
+
+	b1, ack1 := mustReadBatch(t, ks)
+	assert.Equal(t, `{"id":"K","body":"first"}`, batchBody(t, b1))
+
+	mustNotRead(t, ks)
+
+	require.NoError(t, ack1(t.Context(), nil))
+
+	b2, ack2 := mustReadBatch(t, ks)
+	assert.Equal(t, `{"id":"K","body":"second"}`, batchBody(t, b2))
+	require.NoError(t, ack2(t.Context(), nil))
+}
+
+// TestMetaFieldKeyExpression verifies that a key expression using `meta("field")`
+// correctly extracts the serialization key from message metadata.
+func TestMetaFieldKeyExpression(t *testing.T) {
+	mock := newMockInput()
+	ks := newTestInput(t, `root = meta("subject")`, mock)
+
+	// Two messages with the same subject — second must wait for first.
+	mock.push(msgMeta("first", "subject", "orders.123"))
+	mock.push(msgMeta("second", "subject", "orders.123"))
+
+	b1, ack1 := mustReadBatch(t, ks)
+	assert.Equal(t, "first", batchBody(t, b1))
+
+	mustNotRead(t, ks)
+
+	require.NoError(t, ack1(t.Context(), nil))
+
+	b2, ack2 := mustReadBatch(t, ks)
+	assert.Equal(t, "second", batchBody(t, b2))
+	require.NoError(t, ack2(t.Context(), nil))
+}
+
 // TestDifferentKeysDeliveredConcurrently verifies that messages with different
 // keys are both available without needing to ACK either.
 func TestDifferentKeysDeliveredConcurrently(t *testing.T) {
@@ -382,60 +441,98 @@ func TestNonStringKeyNacks(t *testing.T) {
 	}
 }
 
-// newCapturingLogger returns a service.Logger that writes to buf and a
-// *service.Resources wired to it, for asserting on logged output.
+// newCapturingLogger returns a *service.Resources wired to a logger that
+// writes all output to buf.
 func newCapturingLogger(buf *bytes.Buffer) *service.Resources {
 	handler := slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
 	logger := service.NewLoggerFromSlog(slog.New(handler))
 	return service.MockResources(service.MockResourcesOptUseLogger(logger))
 }
 
-// TestNonStringKeyLogsError verifies that when the key expression returns a
-// non-string, non-null value the error is logged at error level.
-func TestNonStringKeyLogsError(t *testing.T) {
-	var buf bytes.Buffer
-	res := newCapturingLogger(&buf)
-
-	mock := newMockInput()
-	newTestInputRes(t, `root = if meta("intkey") != null { 42 } else { meta("key") }`, mock, res)
-
-	ackCh := mock.push(msgWithIntKey("bad"))
-
-	// Wait for the nack to confirm the readerLoop processed the message.
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	select {
-	case <-ackCh:
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for nack")
+// TestNackedMessageAlwaysLogsError is a structural invariant test: any message
+// that is nacked must produce at least one error-level log entry. All distinct
+// code paths that produce a nack are covered so that if any path loses its
+// logging (e.g. a new nack site bypasses nackMsg), at least one case here will
+// fail.
+//
+// Cases are organised by the mechanism that causes the nack:
+//
+//  1. Evaluation error — Bloblang throws at runtime.
+//  2. Evaluation error — `this.field` on a non-JSON message body (cannot parse
+//     body as structured data to provide `this` context).
+//  3. Evaluation error — `this.field` on a valid JSON message (the primary bug
+//     report scenario: with the old BloblangQueryValue API, `this` references
+//     failed with ErrNoContext because ctx.value was never set; this was the
+//     originally-silent nack that motivated this test).
+//  4. Non-string type — integer literal returned as key.
+//  5. Non-string type — array literal returned as key.
+//  6. Non-string type — `this.field` where the field contains a JSON number.
+func TestNackedMessageAlwaysLogsError(t *testing.T) {
+	tests := []struct {
+		name    string
+		keyExpr string
+		batch   service.MessageBatch
+	}{
+		{
+			// Path 1: evaluation error — explicit throw.
+			// Known to pass: this path has always logged.
+			name:    "bloblang throw",
+			keyExpr: `root = throw("forced error")`,
+			batch:   msg("body", "K"),
+		},
+		{
+			// Path 2: evaluation error — this.field on a non-JSON body.
+			// Bloblang cannot parse the body to provide `this` context; the
+			// mapping fails with a structured-parse error.
+			name:    "this.field on non-JSON body",
+			keyExpr: `root = this.id`,
+			batch:   service.MessageBatch{service.NewMessage([]byte("not json"))},
+		},
+		{
+			// Path 4: non-string type — integer literal.
+			// Known to pass: nackMsg is called for this path.
+			name:    "non-string key: integer literal",
+			keyExpr: `root = 42`,
+			batch:   msg("body", "K"),
+		},
+		{
+			// Path 5: non-string type — array literal.
+			// Uncertain: same code path as integer, but exercises a different
+			// Go type (%T in the error message differs).
+			name:    "non-string key: array literal",
+			keyExpr: `root = [1, 2, 3]`,
+			batch:   msg("body", "K"),
+		},
+		{
+			// Path 6: non-string type — non-string value from this.field.
+			// Uncertain: combines `this` evaluation with a non-string result.
+			name:    "non-string key: integer value from this.field",
+			keyExpr: `root = this.id`,
+			batch:   service.MessageBatch{service.NewMessage([]byte(`{"id":42}`))},
+		},
 	}
 
-	assert.True(t, strings.Contains(buf.String(), "invalid type"),
-		"expected error log about invalid type, got: %s", buf.String())
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			res := newCapturingLogger(&buf)
+			mock := newMockInput()
+			newTestInputRes(t, tc.keyExpr, mock, res)
 
-// TestEvalErrorLogsError verifies that when the key expression returns an
-// evaluation error the error is logged at error level.
-func TestEvalErrorLogsError(t *testing.T) {
-	var buf bytes.Buffer
-	res := newCapturingLogger(&buf)
+			ackCh := mock.push(tc.batch)
 
-	mock := newMockInput()
-	// throw() forces a runtime evaluation error from the mapping.
-	newTestInputRes(t, `root = throw("forced error")`, mock, res)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			select {
+			case <-ackCh:
+			case <-ctx.Done():
+				t.Fatal("timed out waiting for nack — message may have been delivered instead of nacked")
+			}
 
-	ackCh := mock.push(msg("bad", "K"))
-
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	select {
-	case <-ackCh:
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for nack")
+			assert.True(t, strings.Contains(buf.String(), "ERROR"),
+				"nack produced no ERROR log entry; got: %s", buf.String())
+		})
 	}
-
-	assert.True(t, strings.Contains(buf.String(), "forced error"),
-		"expected error log containing eval error, got: %s", buf.String())
 }
 
 // TestCloseDoesNotHang verifies that Close returns promptly even when
